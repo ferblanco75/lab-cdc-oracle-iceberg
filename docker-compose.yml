@@ -1,0 +1,205 @@
+# =====================================================================
+#  Laboratorio CDC: Oracle -> Debezium -> Kafka -> Spark -> Iceberg -> Trino
+#  Simula en chico la arquitectura propuesta para ARCA:
+#    Oracle Exadata      -> Oracle Database Free 23ai (gvenzl/oracle-free)
+#    GoldenGate BigData  -> Debezium (Kafka Connect, LogMiner)
+#    Kafka               -> Apache Kafka 3.9 (KRaft, sin ZooKeeper)
+#    Data Fabric storage -> RustFS (object store compatible S3)
+#    Lakehouse Gateway   -> Iceberg REST Catalog
+#    Spark / Presto      -> Spark (tabulario/spark-iceberg) + Trino
+#    Superset (BI)       -> Apache Superset 4.1 conectado a Trino
+#  RAM recomendada para Docker: 12-16 GB.
+# =====================================================================
+name: lab-cdc
+
+services:
+
+  # ---------------- ORIGEN TRANSACCIONAL ----------------
+  oracle:
+    image: gvenzl/oracle-free:23
+    container_name: oracle
+    environment:
+      ORACLE_PASSWORD: oracle            # password de SYS / SYSTEM
+    ports:
+      - "1521:1521"
+    volumes:
+      - oracle-data:/opt/oracle/oradata
+      - ./oracle/init:/container-entrypoint-initdb.d   # se ejecuta SOLO la primera vez
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 15s
+      timeout: 10s
+      retries: 60
+      start_period: 120s
+    networks: [lab_net]
+
+  # ---------------- BUS DE EVENTOS ----------------
+  kafka:
+    image: apache/kafka:3.9.0
+    container_name: kafka
+    ports:
+      - "29092:29092"                    # acceso desde tu máquina: localhost:29092
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,PLAINTEXT_HOST://:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_LOG_RETENTION_HOURS: 168     # 7 días: habilita "replay" de eventos
+    networks: [lab_net]
+
+  # ---------------- CDC (equivalente a GoldenGate) ----------------
+  connect:
+    build: ./debezium
+    image: lab/debezium-connect-oracle:3.0
+    container_name: connect
+    depends_on: [kafka, oracle]
+    ports:
+      - "8083:8083"                      # API REST de Kafka Connect
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: connect-lab
+      CONFIG_STORAGE_TOPIC: _connect_configs
+      OFFSET_STORAGE_TOPIC: _connect_offsets
+      STATUS_STORAGE_TOPIC: _connect_status
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: 1
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: 1
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+    networks: [lab_net]
+
+  kafka-ui:
+    image: kafbat/kafka-ui:latest
+    container_name: kafka-ui
+    depends_on: [kafka, connect]
+    ports:
+      - "8081:8080"                      # http://localhost:8081
+    environment:
+      KAFKA_CLUSTERS_0_NAME: lab
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: debezium
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://connect:8083
+    networks: [lab_net]
+
+  # ---------------- LAKEHOUSE: almacenamiento + catálogo ----------------
+  # Object store compatible S3 (rol de HPE Data Fabric Object Store).
+  # Mismo esquema que usa hoy el quickstart oficial de Apache Iceberg.
+  object-store:
+    image: rustfs/rustfs:1.0.0
+    container_name: object-store
+    environment:
+      RUSTFS_ACCESS_KEY: admin
+      RUSTFS_SECRET_KEY: password
+      RUSTFS_OBS_LOG_STDOUT_ENABLED: "true"
+      RUSTFS_SERVER_DOMAINS: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"                      # consola web: http://localhost:9001
+    volumes:
+      - lake-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:9000/health/ready"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      lab_net:
+        aliases: [minio, warehouse.minio]   # spark-iceberg espera "minio"
+
+  create-bucket:
+    image: rustfs/rustfs:1.0.0
+    container_name: create-bucket
+    depends_on:
+      object-store:
+        condition: service_healthy
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - >-
+        curl -sf -o /dev/null --aws-sigv4 aws:amz:us-east-1:s3 --user admin:password
+        --head http://object-store:9000/warehouse ||
+        curl -sSf --aws-sigv4 aws:amz:us-east-1:s3 --user admin:password
+        -X PUT http://object-store:9000/warehouse
+    networks: [lab_net]
+
+  # Catálogo Iceberg REST (rol del HPE Data Lakehouse Gateway)
+  rest:
+    image: apache/iceberg-rest-fixture
+    container_name: iceberg-rest
+    depends_on: [create-bucket]
+    ports:
+      - "8181:8181"
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://object-store:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    networks: [lab_net]
+
+  # ---------------- PROCESAMIENTO ----------------
+  spark-iceberg:
+    image: tabulario/spark-iceberg
+    container_name: spark-iceberg
+    depends_on: [rest, object-store, kafka]
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      KAFKA_BOOTSTRAP: kafka:9092
+    ports:
+      - "8888:8888"                      # Jupyter: http://localhost:8888
+      - "8080:8080"                      # Spark UI
+      - "4040:4040"                      # UI del job en ejecución
+    volumes:
+      - ./spark/jobs:/home/iceberg/jobs
+      - ./notebooks:/home/iceberg/notebooks/notebooks
+      - spark-checkpoints:/home/iceberg/checkpoints
+    networks: [lab_net]
+
+  # ---------------- CONSULTA SQL (rol de Presto) ----------------
+  trino:
+    image: trinodb/trino:latest          # para reproducibilidad, fijá una versión
+    container_name: trino
+    depends_on: [rest]
+    ports:
+      - "8085:8080"                      # http://localhost:8085
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog
+    networks: [lab_net]
+
+  # ---------------- VISUALIZACIÓN (BI) ----------------
+  superset:
+    build: ./superset
+    image: lab/superset-trino:4.1.1
+    container_name: superset
+    mem_limit: 1536m
+    ports:
+      - "8088:8088"                      # http://localhost:8088  (admin / admin)
+    environment:
+      SUPERSET_SECRET_KEY: "cambiar-esta-clave-solo-para-laboratorio"
+    volumes:
+      - superset-home:/app/superset_home
+      - ./superset/iniciar.sh:/app/iniciar.sh:ro
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+    command: ["/bin/bash", "/app/iniciar.sh"]
+    networks: [lab_net]
+
+volumes:
+  oracle-data:
+  lake-data:
+  spark-checkpoints:
+  superset-home:
+
+networks:
+  lab_net:

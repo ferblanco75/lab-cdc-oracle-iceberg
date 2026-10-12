@@ -1,0 +1,31 @@
+{
+  "name": "oracle-lab",
+  "config": {
+    "connector.class": "io.debezium.connector.oracle.OracleConnector",
+    "tasks.max": "1",
+
+    "database.hostname": "oracle",
+    "database.port": "1521",
+    "database.user": "c##dbzuser",
+    "database.password": "dbz",
+    "database.dbname": "FREE",
+    "database.pdb.name": "FREEPDB1",
+
+    "topic.prefix": "lab",
+    "table.include.list": "LAB.CLIENTES,LAB.PAGOS",
+
+    "snapshot.mode": "initial",
+    "log.mining.strategy": "online_catalog",
+    "decimal.handling.mode": "double",
+    "tombstones.on.delete": "false",
+
+    "schema.history.internal.kafka.bootstrap.servers": "kafka:9092",
+    "schema.history.internal.kafka.topic": "_schema_history.lab",
+    "schema.history.internal.store.only.captured.tables.ddl": "true",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "false"
+  }
+}
