@@ -225,3 +225,109 @@ FROM sh.sales s
          JOIN sh.channels c ON c.channel_id = s.channel_id
 GROUP BY c.channel_desc
 ORDER BY productos_vendidos;
+
+-- =========================================================
+-- Semana 1 · Día 4 · CTEs
+-- =========================================================
+
+sql
+-- Paso 1: clientes perdidos con CTEs
+WITH clientes_2021 AS (
+    SELECT DISTINCT cust_id
+    FROM sh.sales
+    WHERE time_id >= DATE '2021-01-01' AND time_id < DATE '2022-01-01'
+),
+     clientes_2022 AS (
+         SELECT DISTINCT cust_id
+         FROM sh.sales
+         WHERE time_id >= DATE '2022-01-01' AND time_id < DATE '2023-01-01'
+     )
+SELECT COUNT(*)
+FROM clientes_2021 a
+WHERE EXISTS (SELECT 1 FROM clientes_2022 b WHERE b.cust_id = a.cust_id);
+
+
+WITH ventas_cliente AS (
+    SELECT cust_id, SUM(amount_sold) AS total
+    FROM sh.sales
+    GROUP BY cust_id
+)
+SELECT COUNT(*) AS clientes, ROUND(SUM(total)) AS ventas
+FROM ventas_cliente;
+
+
+WITH ventas_cliente AS (
+    SELECT cust_id, SUM(amount_sold) AS total
+    FROM sh.sales
+    GROUP BY cust_id
+),
+     segmentado AS (
+         SELECT cust_id, total,
+                CASE WHEN total >= 10000 THEN '1-Alto'
+                     WHEN total >=  2000 THEN '2-Medio'
+                     ELSE '3-Bajo' END AS segmento
+         FROM ventas_cliente
+     )
+SELECT segmento, COUNT(*) AS clientes
+FROM segmentado
+GROUP BY segmento
+ORDER BY segmento;
+
+
+WITH ventas_cliente AS (
+    SELECT cust_id, SUM(amount_sold) AS total
+    FROM sh.sales
+    GROUP BY cust_id
+),
+     segmentado AS (
+         SELECT cust_id, total,
+                CASE WHEN total >= 10000 THEN '1-Alto'
+                     WHEN total >=  2000 THEN '2-Medio'
+                     ELSE '3-Bajo' END AS segmento
+         FROM ventas_cliente
+     ),
+     totales AS (
+         SELECT COUNT(*) AS clientes, SUM(total) AS ventas
+         FROM segmentado
+     )
+SELECT s.segmento,
+       COUNT(*)                                       AS clientes,
+       ROUND(100 * COUNT(*) / MAX(t.clientes), 1)     AS pct_clientes,
+       ROUND(100 * SUM(s.total) / MAX(t.ventas), 1)   AS pct_ventas
+FROM segmentado s
+         CROSS JOIN totales t
+GROUP BY s.segmento
+ORDER BY s.segmento;
+
+
+WITH ventas_region_anio AS (
+    SELECT co.country_region AS region,
+           t.calendar_year AS anio,
+           SUM(s.amount_sold) AS ventas
+    FROM sh.sales s
+             JOIN sh.times t ON s.TIME_ID = t.TIME_ID
+             JOIN sh.CUSTOMERS cu ON s.CUST_ID = cu.CUST_ID
+             JOIN sh.COUNTRIES co ON cu.COUNTRY_ID = co.COUNTRY_ID
+    GROUP BY co.country_region, t.calendar_year
+),
+     total_region AS (
+         SELECT region, SUM(ventas) AS total
+         FROM ventas_region_anio
+         GROUP BY region
+     )
+SELECT v.region, v.anio, ROUND(v.ventas) AS ventas, ROUND(t.total) AS total_region
+FROM ventas_region_anio v
+         JOIN total_region t ON v.region = t.region
+WHERE t.total > 5000000
+ORDER BY t.total DESC, v.anio;
+
+
+
+-- ORDEN DE ESCRITURA
+--SELECT    ...
+--FROM      ...
+--JOIN      ...
+--WHERE     ...      -- después de los JOIN
+--GROUP BY  ...
+--HAVING    ...      -- siempre después del GROUP BY
+--ORDER BY  ...      -- siempre al final
